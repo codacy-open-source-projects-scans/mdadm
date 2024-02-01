@@ -1825,7 +1825,7 @@ static void print_imsm_dev(struct intel_super *super,
 	printf("\n");
 	printf("    Failed disk : ");
 	if (map->failed_disk_num == 0xff)
-		printf("none");
+		printf(STR_COMMON_NONE);
 	else
 		printf("%i", map->failed_disk_num);
 	printf("\n");
@@ -8678,23 +8678,6 @@ static int imsm_set_array_state(struct active_array *a, int consistent)
 			/* still reshaping, maybe update vol_curr_migr_unit */
 			goto mark_checkpoint;
 		} else {
-			if (a->last_checkpoint == 0 && a->prev_action == reshape) {
-				/* for some reason we aborted the reshape.
-				 *
-				 * disable automatic metadata rollback
-				 * user action is required to recover process
-				 */
-				if (0) {
-					struct imsm_map *map2 =
-						get_imsm_map(dev, MAP_1);
-					dev->vol.migr_state = 0;
-					set_migr_type(dev, 0);
-					set_vol_curr_migr_unit(dev, 0);
-					memcpy(map, map2,
-					       sizeof_imsm_map(map2));
-					super->updates_pending++;
-				}
-			}
 			if (a->last_checkpoint >= a->info.component_size) {
 				unsigned long long array_blocks;
 				int used_disks;
@@ -11156,11 +11139,11 @@ int recover_backup_imsm(struct supertype *st, struct mdinfo *info)
 	unsigned int sector_size = super->sector_size;
 	unsigned long long curr_migr_unit = current_migr_unit(migr_rec);
 	unsigned long long num_migr_units = get_num_migr_units(migr_rec);
-	char buffer[20];
+	char buffer[SYSFS_MAX_BUF_SIZE];
 	int skipped_disks = 0;
 	struct dl *dl_disk;
 
-	err = sysfs_get_str(info, NULL, "array_state", (char *)buffer, 20);
+	err = sysfs_get_str(info, NULL, "array_state", (char *)buffer, sizeof(buffer));
 	if (err < 1)
 		return 1;
 
@@ -12079,14 +12062,14 @@ exit_imsm_reshape_super:
 static int read_completed(int fd, unsigned long long *val)
 {
 	int ret;
-	char buf[50];
+	char buf[SYSFS_MAX_BUF_SIZE];
 
-	ret = sysfs_fd_get_str(fd, buf, 50);
+	ret = sysfs_fd_get_str(fd, buf, sizeof(buf));
 	if (ret < 0)
 		return ret;
 
 	ret = COMPLETED_OK;
-	if (strncmp(buf, "none", 4) == 0) {
+	if (str_is_none(buf) == true) {
 		ret = COMPLETED_NONE;
 	} else if (strncmp(buf, "delayed", 7) == 0) {
 		ret = COMPLETED_DELAYED;
@@ -12154,12 +12137,12 @@ int wait_for_reshape_imsm(struct mdinfo *sra, int ndata)
 
 	do {
 		int rc;
-		char action[20];
+		char action[SYSFS_MAX_BUF_SIZE];
 		int timeout = 3000;
 
 		sysfs_wait(fd, &timeout);
 		if (sysfs_get_str(sra, NULL, "sync_action",
-				  action, 20) > 0 &&
+				  action, sizeof(action)) > 0 &&
 				strncmp(action, "reshape", 7) != 0) {
 			if (strncmp(action, "idle", 4) == 0)
 				break;
@@ -12206,7 +12189,7 @@ int check_degradation_change(struct mdinfo *info,
 			if (sd->disk.state & (1<<MD_DISK_FAULTY))
 				continue;
 			if (sd->disk.state & (1<<MD_DISK_SYNC)) {
-				char sbuf[100];
+				char sbuf[SYSFS_MAX_BUF_SIZE];
 				int raid_disk = sd->disk.raid_disk;
 
 				if (sysfs_get_str(info,

@@ -148,7 +148,7 @@ struct mdinfo *sysfs_read(int fd, char *devnm, unsigned long options)
 		strcpy(base, "metadata_version");
 		if (load_sys(fname, buf, sizeof(buf)))
 			goto abort;
-		if (strncmp(buf, "none", 4) == 0) {
+		if (str_is_none(buf) == true) {
 			sra->array.major_version =
 				sra->array.minor_version = -1;
 			strcpy(sra->text_version, "");
@@ -244,7 +244,7 @@ struct mdinfo *sysfs_read(int fd, char *devnm, unsigned long options)
 			goto abort;
 		if (strncmp(buf, "file", 4) == 0)
 			sra->bitmap_offset = 1;
-		else if (strncmp(buf, "none", 4) == 0)
+		else if (str_is_none(buf) == true)
 			sra->bitmap_offset = 0;
 		else if (buf[0] == '+')
 			sra->bitmap_offset = strtol(buf+1, NULL, 10);
@@ -664,7 +664,7 @@ int sysfs_set_array(struct mdinfo *info, int vers)
 	ver[0] = 0;
 	if (info->array.major_version == -1 &&
 	    info->array.minor_version == -2) {
-		char buf[1024];
+		char buf[SYSFS_MAX_BUF_SIZE];
 
 		strcat(strcpy(ver, "external:"), info->text_version);
 
@@ -675,7 +675,7 @@ int sysfs_set_array(struct mdinfo *info, int vers)
 		 * version first, and preserve the flag
 		 */
 		if (sysfs_get_str(info, NULL, "metadata_version",
-				  buf, 1024) > 0)
+				  buf, sizeof(buf)) > 0)
 			if (strlen(buf) >= 9 && buf[9] == '-')
 				ver[9] = '-';
 
@@ -900,11 +900,11 @@ int sysfs_freeze_array(struct mdinfo *sra)
 	 * return 0 if this kernel doesn't support 'frozen'
 	 * return 1 if it worked.
 	 */
-	char buf[20];
+	char buf[SYSFS_MAX_BUF_SIZE];
 
 	if (!sysfs_attribute_available(sra, NULL, "sync_action"))
 		return 1; /* no sync_action == frozen */
-	if (sysfs_get_str(sra, NULL, "sync_action", buf, 20) <= 0)
+	if (sysfs_get_str(sra, NULL, "sync_action", buf, sizeof(buf)) <= 0)
 		return 0;
 	if (strcmp(buf, "frozen\n") == 0)
 		/* Already frozen */
