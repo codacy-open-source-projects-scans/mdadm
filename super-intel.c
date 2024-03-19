@@ -1736,48 +1736,6 @@ static __u32 imsm_min_reserved_sectors(struct intel_super *super)
 	return  (remainder < rv) ? remainder : rv;
 }
 
-/*
- * Return minimum size of a spare and sector size
- * that can be used in this array
- */
-int get_spare_criteria_imsm(struct supertype *st, struct spare_criteria *c)
-{
-	struct intel_super *super = st->sb;
-	struct dl *dl;
-	struct extent *e;
-	int i;
-	unsigned long long size = 0;
-
-	c->min_size = 0;
-	c->sector_size = 0;
-
-	if (!super)
-		return -EINVAL;
-	/* find first active disk in array */
-	dl = super->disks;
-	while (dl && (is_failed(&dl->disk) || dl->index == -1))
-		dl = dl->next;
-	if (!dl)
-		return -EINVAL;
-	/* find last lba used by subarrays */
-	e = get_extents(super, dl, 0);
-	if (!e)
-		return -EINVAL;
-	for (i = 0; e[i].size; i++)
-		continue;
-	if (i > 0)
-		size = e[i-1].start + e[i-1].size;
-	free(e);
-
-	/* add the amount of space needed for metadata */
-	size += imsm_min_reserved_sectors(super);
-
-	c->min_size = size * 512;
-	c->sector_size = super->sector_size;
-
-	return 0;
-}
-
 static bool is_gen_migration(struct imsm_dev *dev);
 
 #define IMSM_4K_DIV 8
@@ -11262,39 +11220,174 @@ abort:
 	return retval;
 }
 
-static char disk_by_path[] = "/dev/disk/by-path/";
-
-static const char *imsm_get_disk_controller_domain(const char *path)
+/**
+ * test_and_add_drive_controller_policy_imsm() - add disk controller to policies list.
+ * @type: Policy type to search on list.
+ * @pols: List of currently recorded policies.
+ * @disk_fd: File descriptor of the device to check.
+ * @hba: The hba disk is attached, could be NULL if verification is disabled.
+ * @verbose: verbose flag.
+ *
+ * IMSM cares about drive physical placement. If @hba is not set, it adds unknown policy.
+ * If there is no controller policy on pols we are free to add first one. If there is a policy then,
+ * new must be the same - no controller mixing allowed.
+ */
+static mdadm_status_t
+test_and_add_drive_controller_policy_imsm(const char * const type, dev_policy_t **pols, int disk_fd,
+					  struct sys_dev *hba, const int verbose)
 {
-	char disk_path[PATH_MAX];
-	char *drv=NULL;
-	struct stat st;
+	const char *controller_policy = get_sys_dev_type(SYS_DEV_UNKNOWN);
+	struct dev_policy *pol = pol_find(*pols, (char *)type);
+	char devname[MAX_RAID_SERIAL_LEN];
 
-	strncpy(disk_path, disk_by_path, PATH_MAX);
-	strncat(disk_path, path, PATH_MAX - strlen(disk_path) - 1);
-	if (stat(disk_path, &st) == 0) {
-		struct sys_dev* hba;
-		char *path;
+	if (hba)
+		controller_policy = get_sys_dev_type(hba->type);
 
-		path = devt_to_devpath(st.st_rdev, 1, NULL);
-		if (path == NULL)
-			return "unknown";
-		hba = find_disk_attached_hba(-1, path);
-		if (hba && hba->type == SYS_DEV_SAS)
-			drv = "isci";
-		else if (hba && (hba->type == SYS_DEV_SATA || hba->type == SYS_DEV_SATA_VMD))
-			drv = "ahci";
-		else if (hba && hba->type == SYS_DEV_VMD)
-			drv = "vmd";
-		else if (hba && hba->type == SYS_DEV_NVME)
-			drv = "nvme";
-		else
-			drv = "unknown";
-		dprintf("path: %s hba: %s attached: %s\n",
-			path, (hba) ? hba->path : "NULL", drv);
-		free(path);
+	if (!pol) {
+		pol_add(pols, (char *)type, (char *)controller_policy, "imsm");
+		return MDADM_STATUS_SUCCESS;
 	}
-	return drv;
+
+	if (strcmp(pol->value, controller_policy) == 0)
+		return MDADM_STATUS_SUCCESS;
+
+	fd2devname(disk_fd, devname);
+	pr_vrb("Intel(R) raid controller \"%s\" found for %s, but \"%s\" was detected earlier\n",
+	       controller_policy, devname, pol->value);
+	pr_vrb("Disks under different controllers cannot be used, aborting\n");
+
+	return MDADM_STATUS_ERROR;
+}
+
+struct imsm_drive_policy {
+	char *type;
+	mdadm_status_t (*test_and_add_drive_policy)(const char * const type,
+						    struct dev_policy **pols, int disk_fd,
+						    struct sys_dev *hba, const int verbose);
+};
+
+struct imsm_drive_policy imsm_policies[] = {
+	{"controller", test_and_add_drive_controller_policy_imsm},
+};
+
+mdadm_status_t test_and_add_drive_policies_imsm(struct dev_policy **pols, int disk_fd,
+						const int verbose)
+{
+	struct imsm_drive_policy *imsm_pol;
+	struct sys_dev *hba = NULL;
+	char path[PATH_MAX];
+	mdadm_status_t ret;
+	unsigned int i;
+
+	/* If imsm platform verification is disabled, do not search for hba. */
+	if (check_no_platform() != 1) {
+		if (!diskfd_to_devpath(disk_fd, 1, path)) {
+			pr_vrb("IMSM: Failed to retrieve device path by file descriptor.\n");
+			return MDADM_STATUS_ERROR;
+		}
+
+		hba = find_disk_attached_hba(disk_fd, path);
+		if (!hba) {
+			pr_vrb("IMSM: Failed to find hba for %s\n", path);
+			return MDADM_STATUS_ERROR;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(imsm_policies); i++) {
+		imsm_pol = &imsm_policies[i];
+
+		ret = imsm_pol->test_and_add_drive_policy(imsm_pol->type, pols, disk_fd, hba,
+							  verbose);
+		if (ret != MDADM_STATUS_SUCCESS)
+			/* Inherit error code */
+			return ret;
+	}
+
+	return MDADM_STATUS_SUCCESS;
+}
+
+/**
+ * get_spare_criteria_imsm() - set spare criteria.
+ * @st: supertype.
+ * @mddev_path: path to md device devnode, it must be container.
+ * @c: spare_criteria struct to fill, not NULL.
+ *
+ * If superblock is not loaded, use mddev_path to load_container. It must be given in this case.
+ * Filles size and sector size accordingly to superblock.
+ */
+mdadm_status_t get_spare_criteria_imsm(struct supertype *st, char *mddev_path,
+				       struct spare_criteria *c)
+{
+	mdadm_status_t ret = MDADM_STATUS_ERROR;
+	bool free_superblock = false;
+	unsigned long long size = 0;
+	struct intel_super *super;
+	struct extent *e;
+	struct dl *dl;
+	int i;
+
+	/* If no superblock and no mddev_path, we cannot load superblock. */
+	assert(st->sb || mddev_path);
+
+	if (mddev_path) {
+		int fd = open(mddev_path, O_RDONLY);
+		mdadm_status_t rv;
+
+		if (!is_fd_valid(fd))
+			return MDADM_STATUS_ERROR;
+
+		if (!st->sb) {
+			if (load_container_imsm(st, fd, st->devnm)) {
+				close(fd);
+				return MDADM_STATUS_ERROR;
+			}
+			free_superblock = true;
+		}
+
+		rv = mddev_test_and_add_drive_policies(st, &c->pols, fd, 0);
+		close(fd);
+
+		if (rv != MDADM_STATUS_SUCCESS)
+			goto out;
+	}
+
+	super = st->sb;
+
+	/* find first active disk in array */
+	dl = super->disks;
+	while (dl && (is_failed(&dl->disk) || dl->index == -1))
+		dl = dl->next;
+
+	if (!dl)
+		goto out;
+
+	/* find last lba used by subarrays */
+	e = get_extents(super, dl, 0);
+	if (!e)
+		goto out;
+
+	for (i = 0; e[i].size; i++)
+		continue;
+	if (i > 0)
+		size = e[i - 1].start + e[i - 1].size;
+	free(e);
+
+	/* add the amount of space needed for metadata */
+	size += imsm_min_reserved_sectors(super);
+
+	c->min_size = size * 512;
+	c->sector_size = super->sector_size;
+	c->criteria_set = true;
+	ret = MDADM_STATUS_SUCCESS;
+
+out:
+	if (free_superblock)
+		free_super_imsm(st);
+
+	if (ret != MDADM_STATUS_SUCCESS)
+		c->criteria_set = false;
+
+	return ret;
 }
 
 static char *imsm_find_array_devnm_by_subdev(int subdev, char *container)
@@ -11427,7 +11520,7 @@ static struct mdinfo *get_spares_for_grow(struct supertype *st)
 {
 	struct spare_criteria sc;
 
-	get_spare_criteria_imsm(st, &sc);
+	get_spare_criteria_imsm(st, NULL, &sc);
 	return container_choose_spares(st, &sc, NULL, NULL, NULL, 0);
 }
 
@@ -12990,7 +13083,7 @@ struct superswitch super_imsm = {
 	.update_subarray = update_subarray_imsm,
 	.load_container	= load_container_imsm,
 	.default_geometry = default_geometry_imsm,
-	.get_disk_controller_domain = imsm_get_disk_controller_domain,
+	.test_and_add_drive_policies = test_and_add_drive_policies_imsm,
 	.reshape_super  = imsm_reshape_super,
 	.manage_reshape = imsm_manage_reshape,
 	.recover_backup = recover_backup_imsm,

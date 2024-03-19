@@ -430,8 +430,10 @@ struct createinfo {
 };
 
 struct spare_criteria {
+	bool criteria_set;
 	unsigned long long min_size;
 	unsigned int sector_size;
+	struct dev_policy *pols;
 };
 
 typedef enum mdadm_status {
@@ -776,6 +778,8 @@ enum sysfs_read_flags {
 
 #define SYSFS_MAX_BUF_SIZE 64
 
+extern void sysfs_get_container_devnm(struct mdinfo *mdi, char *buf);
+
 /* If fd >= 0, get the array it is open on,
  * else use devnm.
  */
@@ -936,6 +940,23 @@ struct reshape {
 	unsigned long long stripes; /* number of old stripes that comprise 'blocks'*/
 	unsigned long long new_size; /* New size of array in sectors */
 };
+
+/**
+ * struct dev_policy - Data structure for policy management.
+ * @next: pointer to next dev_policy.
+ * @name: policy name, category.
+ * @metadata: the metadata type it affects.
+ * @value: value of the policy.
+ *
+ * The functions to manipulate dev_policy lists do not free elements, so they must be statically
+ * allocated. @name and @metadata can be compared by address.
+ */
+typedef struct dev_policy {
+	struct dev_policy *next;
+	char *name;
+	const char *metadata;
+	const char *value;
+} dev_policy_t;
 
 /* A superswitch provides entry point to a metadata handler.
  *
@@ -1115,10 +1136,9 @@ extern struct superswitch {
 	 * Return spare criteria for array:
 	 * - minimum disk size can be used in array;
 	 * - sector size can be used in array.
-	 * Return values: 0 - for success and -EINVAL on error.
 	 */
-	int (*get_spare_criteria)(struct supertype *st,
-				  struct spare_criteria *sc);
+	mdadm_status_t (*get_spare_criteria)(struct supertype *st, char *mddev_path,
+					     struct spare_criteria *sc);
 	/* Find somewhere to put a bitmap - possibly auto-size it - and
 	 * update the metadata to record this.  The array may be newly
 	 * created, in which case data_size may be updated, or it might
@@ -1165,6 +1185,25 @@ extern struct superswitch {
 				 unsigned long long data_offset,
 				 char *subdev, unsigned long long *freesize,
 				 int consistency_policy, int verbose);
+
+	/**
+	 * test_and_add_drive_policies() - test new and add custom policies from metadata handler.
+	 * @pols: list of currently recorded policies.
+	 * @disk_fd: file descriptor of the device to check.
+	 * @verbose: verbose flag.
+	 *
+	 * Used by IMSM to verify all drives in container/array, against requirements not recored
+	 * in superblock, like controller type for IMSM. It should check all drives even if
+	 * they are not actually used, because mdmon or kernel are free to use any drive assigned to
+	 * container automatically.
+	 *
+	 * Generating and comparison methods belong to metadata handler. It is not mandatory to be
+	 * implemented.
+	 *
+	 * Return: MDADM_STATUS_SUCCESS is expected on success.
+	 */
+	mdadm_status_t (*test_and_add_drive_policies)(dev_policy_t **pols, int disk_fd,
+						      const int verbose);
 
 	/* Return a linked list of 'mdinfo' structures for all arrays
 	 * in the container.  For non-containers, it is like
@@ -1247,21 +1286,6 @@ extern struct superswitch {
 	 */
 	struct mdinfo *(*activate_spare)(struct active_array *a,
 					 struct metadata_update **updates);
-	/*
-	 * Return statically allocated string that represents metadata specific
-	 * controller domain of the disk. The domain is used in disk domain
-	 * matching functions. Disks belong to the same domain if the they have
-	 * the same domain from mdadm.conf and belong the same metadata domain.
-	 * Returning NULL or not providing this handler means that metadata
-	 * does not distinguish the differences between disks that belong to
-	 * different controllers. They are in the domain specified by
-	 * configuration file (mdadm.conf).
-	 * In case when the metadata has the notion of domains based on disk
-	 * it shall return NULL for disks that do not belong to the controller
-	 * the supported domains. Such disks will form another domain and won't
-	 * be mixed with supported ones.
-	 */
-	const char *(*get_disk_controller_domain)(const char *path);
 
 	/* for external backup area */
 	int (*recover_backup)(struct supertype *st, struct mdinfo *info);
@@ -1368,26 +1392,7 @@ extern struct supertype *dup_super(struct supertype *st);
 extern int get_dev_size(int fd, char *dname, unsigned long long *sizep);
 extern int get_dev_sector_size(int fd, char *dname, unsigned int *sectsizep);
 extern int must_be_container(int fd);
-extern int dev_size_from_id(dev_t id, unsigned long long *size);
-extern int dev_sector_size_from_id(dev_t id, unsigned int *size);
 void wait_for(char *dev, int fd);
-
-/*
- * Data structures for policy management.
- * Each device can have a policy structure that lists
- * various name/value pairs each possibly with a metadata associated.
- * The policy list is sorted by name/value/metadata
- */
-struct dev_policy {
-	struct dev_policy *next;
-	char *name;	/* None of these strings are allocated.  They are
-			 * all just references to strings which are known
-			 * to exist elsewhere.
-			 * name and metadata can be compared by address equality.
-			 */
-	const char *metadata;
-	const char *value;
-};
 
 extern char pol_act[], pol_domain[], pol_metadata[], pol_auto[];
 
@@ -1430,9 +1435,15 @@ extern struct dev_policy *disk_policy(struct mdinfo *disk);
 extern struct dev_policy *devid_policy(int devid);
 extern void dev_policy_free(struct dev_policy *p);
 
-//extern void pol_new(struct dev_policy **pol, char *name, char *val, char *metadata);
 extern void pol_add(struct dev_policy **pol, char *name, char *val, char *metadata);
 extern struct dev_policy *pol_find(struct dev_policy *pol, char *name);
+
+extern mdadm_status_t drive_test_and_add_policies(struct supertype *st, dev_policy_t **pols,
+						  int fd, const int verbose);
+extern mdadm_status_t sysfs_test_and_add_drive_policies(struct supertype *st, dev_policy_t **pols,
+							struct mdinfo *mdi, const int verbose);
+extern mdadm_status_t mddev_test_and_add_drive_policies(struct supertype *st, dev_policy_t **pols,
+							int array_fd, const int verbose);
 
 enum policy_action {
 	act_default,
@@ -1708,6 +1719,9 @@ extern int assemble_container_content(struct supertype *st, int mdfd,
 #define	INCR_UNSAFE	2
 #define	INCR_ALREADY	4
 #define	INCR_YES	8
+
+extern bool devid_matches_criteria(struct supertype *st, dev_t devid, struct spare_criteria *sc);
+extern bool disk_fd_matches_criteria(struct supertype *st, int disk_fd, struct spare_criteria *sc);
 extern struct mdinfo *container_choose_spares(struct supertype *st,
 					      struct spare_criteria *criteria,
 					      struct domainlist *domlist,
