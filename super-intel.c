@@ -27,6 +27,7 @@
 #include <scsi/sg.h>
 #include <ctype.h>
 #include <dirent.h>
+#include "drive_encryption.h"
 
 /* MPB == Metadata Parameter Block */
 #define MPB_SIGNATURE "Intel Raid ISM Cfg Sig. "
@@ -392,8 +393,6 @@ struct md_list {
 	dev_t st_rdev;
 	struct md_list *next;
 };
-
-#define pr_vrb(fmt, arg...) (void) (verbose && pr_err(fmt, ##arg))
 
 static __u8 migr_type(struct imsm_dev *dev)
 {
@@ -2351,12 +2350,41 @@ static int imsm_read_serial(int fd, char *devname, __u8 *serial,
 			    size_t serial_buf_len);
 static void fd2devname(int fd, char *name);
 
-static int ahci_enumerate_ports(const char *hba_path, int port_count, int host_base, int verbose)
+void print_encryption_information(int disk_fd, enum sys_dev_type hba_type)
+{
+	struct encryption_information information = {0};
+	mdadm_status_t status = MDADM_STATUS_SUCCESS;
+	const char *indent = "                  ";
+
+	switch (hba_type) {
+	case SYS_DEV_VMD:
+	case SYS_DEV_NVME:
+		status = get_nvme_opal_encryption_information(disk_fd, &information, 1);
+		break;
+	case SYS_DEV_SATA:
+	case SYS_DEV_SATA_VMD:
+		status = get_ata_encryption_information(disk_fd, &information, 1);
+		break;
+	default:
+		return;
+	}
+
+	if (status) {
+		pr_err("Failed to get drive encryption information.\n");
+		return;
+	}
+
+	printf("%sEncryption(Ability|Status): %s|%s\n", indent,
+	       get_encryption_ability_string(information.ability),
+	       get_encryption_status_string(information.status));
+}
+
+static int ahci_enumerate_ports(struct sys_dev *hba, int port_count, int host_base, int verbose)
 {
 	/* dump an unsorted list of devices attached to AHCI Intel storage
 	 * controller, as well as non-connected ports
 	 */
-	int hba_len = strlen(hba_path) + 1;
+	int hba_len = strlen(hba->path) + 1;
 	struct dirent *ent;
 	DIR *dir;
 	char *path = NULL;
@@ -2392,7 +2420,7 @@ static int ahci_enumerate_ports(const char *hba_path, int port_count, int host_b
 		path = devt_to_devpath(makedev(major, minor), 1, NULL);
 		if (!path)
 			continue;
-		if (!path_attached_to_hba(path, hba_path)) {
+		if (!path_attached_to_hba(path, hba->path)) {
 			free(path);
 			path = NULL;
 			continue;
@@ -2495,6 +2523,8 @@ static int ahci_enumerate_ports(const char *hba_path, int port_count, int host_b
 				printf(" (%s)\n", buf);
 			else
 				printf(" ()\n");
+
+			print_encryption_information(fd, hba->type);
 			close(fd);
 		}
 		free(path);
@@ -2558,6 +2588,8 @@ static int print_nvme_info(struct sys_dev *hba)
 			printf(" (%s)\n", buf);
 		else
 			printf("()\n");
+
+		print_encryption_information(fd, hba->type);
 
 skip:
 		close_fd(&fd);
@@ -2814,7 +2846,7 @@ static int detail_platform_imsm(int verbose, int enumerate_only, char *controlle
 				hba->path, get_sys_dev_type(hba->type));
 			if (hba->type == SYS_DEV_SATA || hba->type == SYS_DEV_SATA_VMD) {
 				host_base = ahci_get_port_count(hba->path, &port_count);
-				if (ahci_enumerate_ports(hba->path, port_count, host_base, verbose)) {
+				if (ahci_enumerate_ports(hba, port_count, host_base, verbose)) {
 					if (verbose > 0)
 						pr_err("failed to enumerate ports on %s controller at %s.\n",
 							get_sys_dev_type(hba->type), hba->pci_id);
@@ -11259,6 +11291,78 @@ test_and_add_drive_controller_policy_imsm(const char * const type, dev_policy_t 
 	return MDADM_STATUS_ERROR;
 }
 
+/**
+ * test_and_add_drive_encryption_policy_imsm() - add disk encryption to policies list.
+ * @type: policy type to search in the list.
+ * @pols: list of currently recorded policies.
+ * @disk_fd: file descriptor of the device to check.
+ * @hba: The hba to which the drive is attached, could be NULL if verification is disabled.
+ * @verbose: verbose flag.
+ *
+ * IMSM cares about drive encryption state. It is not allowed to mix disks with different
+ * encryption state within one md device.
+ * If there is no encryption policy on pols we are free to add first one.
+ * If there is a policy then, new must be the same.
+ */
+static mdadm_status_t
+test_and_add_drive_encryption_policy_imsm(const char * const type, dev_policy_t **pols, int disk_fd,
+					  struct sys_dev *hba, const int verbose)
+{
+	struct dev_policy *expected_policy = pol_find(*pols, (char *)type);
+	struct encryption_information information = {0};
+	char *encryption_state = "Unknown";
+	int status = MDADM_STATUS_SUCCESS;
+	bool encryption_checked = true;
+	char devname[PATH_MAX];
+
+	if (!hba)
+		goto check_policy;
+
+	switch (hba->type) {
+	case SYS_DEV_NVME:
+	case SYS_DEV_VMD:
+		status = get_nvme_opal_encryption_information(disk_fd, &information, verbose);
+		break;
+	case SYS_DEV_SATA:
+	case SYS_DEV_SATA_VMD:
+		status = get_ata_encryption_information(disk_fd, &information, verbose);
+		break;
+	default:
+		encryption_checked = false;
+	}
+
+	if (status) {
+		fd2devname(disk_fd, devname);
+		pr_vrb("Failed to read encryption information of device %s\n", devname);
+		return MDADM_STATUS_ERROR;
+	}
+
+	if (encryption_checked) {
+		if (information.status == ENC_STATUS_LOCKED) {
+			fd2devname(disk_fd, devname);
+			pr_vrb("Device %s is in Locked state, cannot use. Aborting.\n", devname);
+			return MDADM_STATUS_ERROR;
+		}
+		encryption_state = (char *)get_encryption_status_string(information.status);
+	}
+
+check_policy:
+	if (expected_policy) {
+		if (strcmp(expected_policy->value, encryption_state) == 0)
+			return MDADM_STATUS_SUCCESS;
+
+		fd2devname(disk_fd, devname);
+		pr_vrb("Encryption status \"%s\" detected for disk %s, but \"%s\" status was detected eariler.\n",
+		       encryption_state, devname, expected_policy->value);
+		pr_vrb("Disks with different encryption status cannot be used.\n");
+		return MDADM_STATUS_ERROR;
+	}
+
+	pol_add(pols, (char *)type, encryption_state, "imsm");
+
+	return MDADM_STATUS_SUCCESS;
+}
+
 struct imsm_drive_policy {
 	char *type;
 	mdadm_status_t (*test_and_add_drive_policy)(const char * const type,
@@ -11268,6 +11372,7 @@ struct imsm_drive_policy {
 
 struct imsm_drive_policy imsm_policies[] = {
 	{"controller", test_and_add_drive_controller_policy_imsm},
+	{"encryption", test_and_add_drive_encryption_policy_imsm}
 };
 
 mdadm_status_t test_and_add_drive_policies_imsm(struct dev_policy **pols, int disk_fd,

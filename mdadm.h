@@ -853,6 +853,7 @@ extern int restore_stripes(int *dest, unsigned long long *offsets,
 			   int source, unsigned long long read_offset,
 			   unsigned long long start, unsigned long long length,
 			   char *src_buf);
+extern bool sysfs_is_libata_allow_tpm_enabled(const int verbose);
 
 #ifndef Sendmail
 #define Sendmail "/usr/lib/sendmail -t"
@@ -1672,6 +1673,7 @@ extern char *conf_get_program(void);
 extern char *conf_get_homehost(int *require_homehostp);
 extern char *conf_get_homecluster(void);
 extern int conf_get_monitor_delay(void);
+extern bool conf_get_sata_opal_encryption_no_verify(void);
 extern char *conf_line(FILE *file);
 extern char *conf_word(FILE *file, int allow_key);
 extern void print_quoted(char *str);
@@ -1910,6 +1912,8 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
 #define cont_err(fmt ...) fprintf(stderr, "       " fmt)
 
 #define pr_info(fmt, args...) printf("%s: "fmt, Name, ##args)
+
+#define pr_vrb(fmt, arg...) ((void)(verbose && pr_err(fmt, ##arg)))
 
 void *xmalloc(size_t len);
 void *xrealloc(void *ptr, size_t len);
