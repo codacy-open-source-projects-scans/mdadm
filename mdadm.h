@@ -594,6 +594,11 @@ enum flag_mode {
 	FlagDefault, FlagSet, FlagClear,
 };
 
+typedef enum {
+	ROLLBACK_METADATA_CHANGES,
+	APPLY_METADATA_CHANGES
+} change_dir_t;
+
 /* structures read from config file */
 /* List of mddevice names and identifiers
  * Identifiers can be:
@@ -667,7 +672,9 @@ struct context {
 };
 
 struct shape {
+	char	*dev;
 	int	raiddisks;
+	int	delta_disks;
 	int	sparedisks;
 	int	journaldisks;
 	int	level;
@@ -682,6 +689,7 @@ struct shape {
 	unsigned long long size;
 	unsigned long long data_offset;
 	int	consistency_policy;
+	change_dir_t direction;
 };
 
 /* List of device names - wildcards expanded */
@@ -1229,15 +1237,8 @@ extern struct superswitch {
 	 * initialized to indicate if reshape is being performed at the
 	 * container or subarray level
 	 */
-#define APPLY_METADATA_CHANGES		1
-#define ROLLBACK_METADATA_CHANGES	0
 
-	int (*reshape_super)(struct supertype *st,
-			     unsigned long long size, int level,
-			     int layout, int chunksize, int raid_disks,
-			     int delta_disks, char *backup, char *dev,
-			     int direction,
-			     int verbose); /* optional */
+	int (*reshape_super)(struct supertype *st, struct shape *shape, struct context *c);
 	int (*manage_reshape)( /* optional */
 		int afd, struct mdinfo *sra, struct reshape *reshape,
 		struct supertype *st, unsigned long blocks,
@@ -1541,8 +1542,7 @@ extern int Grow_reshape(char *devname, int fd,
 extern int Grow_restart(struct supertype *st, struct mdinfo *info,
 			int *fdlist, int cnt, char *backup_file, int verbose);
 extern int Grow_continue(int mdfd, struct supertype *st,
-			 struct mdinfo *info, char *backup_file,
-			 int forked, int freeze_reshape);
+			 struct mdinfo *info, int forked, struct context *c);
 extern int Grow_consistency_policy(char *devname, int fd,
 				   struct context *c, struct shape *s);
 
@@ -1552,8 +1552,7 @@ extern int restore_backup(struct supertype *st,
 			  int spares,
 			  char **backup_filep,
 			  int verbose);
-extern int Grow_continue_command(char *devname, int fd,
-				 char *backup_file, int verbose);
+extern int Grow_continue_command(char *devname, int fd, struct context *c);
 
 extern int Assemble(struct supertype *st, char *mddev,
 		    struct mddev_ident *ident,
