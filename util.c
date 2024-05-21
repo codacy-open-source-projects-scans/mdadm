@@ -1902,7 +1902,7 @@ unsigned long long min_recovery_start(struct mdinfo *array)
 	return recovery_start;
 }
 
-int mdmon_pid(char *devnm)
+int mdmon_pid(const char *devnm)
 {
 	char path[100];
 	char pid[10];
@@ -1922,7 +1922,7 @@ int mdmon_pid(char *devnm)
 	return atoi(pid);
 }
 
-int mdmon_running(char *devnm)
+int mdmon_running(const char *devnm)
 {
 	int pid = mdmon_pid(devnm);
 	if (pid <= 0)
@@ -1930,6 +1930,35 @@ int mdmon_running(char *devnm)
 	if (kill(pid, 0) == 0)
 		return 1;
 	return 0;
+}
+
+/*
+ * wait_for_mdmon() - Waits for mdmon within specified time.
+ * @devnm: Device for which mdmon should start.
+ *
+ * Function waits for mdmon to start. It may need few seconds
+ * to start, we set timeout to 5, it should be sufficient.
+ * Do not wait if mdmon has been started.
+ *
+ * Return: MDADM_STATUS_SUCCESS if mdmon is running, error code otherwise.
+ */
+mdadm_status_t wait_for_mdmon(const char *devnm)
+{
+	const time_t mdmon_timeout = 5;
+	time_t start_time = time(0);
+
+	if (mdmon_running(devnm))
+		return MDADM_STATUS_SUCCESS;
+
+	pr_info("Waiting for mdmon to start\n");
+	while (time(0) - start_time < mdmon_timeout) {
+		sleep_for(0, MSEC_TO_NSEC(200), true);
+		if (mdmon_running(devnm))
+			return MDADM_STATUS_SUCCESS;
+	};
+
+	pr_err("Timeout waiting for mdmon\n");
+	return MDADM_STATUS_ERROR;
 }
 
 int start_mdmon(char *devnm)
