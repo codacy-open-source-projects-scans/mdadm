@@ -123,13 +123,15 @@ static void mdstat_ent_list_detach_element(struct mdstat_ent **list_head, struct
 				ent->next = el->next;
 				break;
 			}
+
+			ent = ent->next;
 		}
 
-		ent = ent->next;
 	}
 
+	/* Guard if not found or list is empty - not allowed */
 	assert(ent);
-	ent->next = NULL;
+	el->next = NULL;
 }
 
 void free_mdstat(struct mdstat_ent *ms)
@@ -194,8 +196,11 @@ struct mdstat_ent *mdstat_read(int hold, int start)
 		f = fopen("/proc/mdstat", "r");
 	if (f == NULL)
 		return NULL;
-	else
-		fcntl(fileno(f), F_SETFD, FD_CLOEXEC);
+
+	if (fcntl(fileno(f), F_SETFD, FD_CLOEXEC) < 0) {
+		fclose(f);
+		return NULL;
+	}
 
 	all = NULL;
 	end = &all;
@@ -329,7 +334,10 @@ struct mdstat_ent *mdstat_read(int hold, int start)
 	}
 	if (hold && mdstat_fd == -1) {
 		mdstat_fd = dup(fileno(f));
-		fcntl(mdstat_fd, F_SETFD, FD_CLOEXEC);
+		if (fcntl(mdstat_fd, F_SETFD, FD_CLOEXEC) < 0) {
+			fclose(f);
+			return NULL;
+		}
 	}
 	fclose(f);
 
