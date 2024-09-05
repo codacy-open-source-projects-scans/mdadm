@@ -800,7 +800,7 @@ static struct sys_dev* find_disk_attached_hba(int fd, const char *devname)
 		return 0;
 
 	for (elem = list; elem; elem = elem->next)
-		if (path_attached_to_hba(disk_path, elem->path))
+		if (is_path_attached_to_hba(disk_path, elem->path))
 			break;
 
 	if (disk_path != devname)
@@ -2412,7 +2412,7 @@ static int ahci_enumerate_ports(struct sys_dev *hba, unsigned long port_count, i
 		path = devt_to_devpath(makedev(major, minor), 1, NULL);
 		if (!path)
 			continue;
-		if (!path_attached_to_hba(path, hba->path)) {
+		if (!is_path_attached_to_hba(path, hba->path)) {
 			free(path);
 			path = NULL;
 			continue;
@@ -2563,7 +2563,7 @@ static int print_nvme_info(struct sys_dev *hba)
 		    !diskfd_to_devpath(fd, 1, cntrl_path))
 			goto skip;
 
-		if (!path_attached_to_hba(cntrl_path, hba->path))
+		if (!is_path_attached_to_hba(cntrl_path, hba->path))
 			goto skip;
 
 		if (!imsm_is_nvme_namespace_supported(fd, 0))
@@ -2663,9 +2663,12 @@ static void print_imsm_chunk_size_capability(const struct imsm_orom *orom)
 }
 
 
-static void print_imsm_capability(const struct imsm_orom *orom)
+static void print_imsm_capability(const struct orom_entry *entry)
 {
+	const struct imsm_orom *orom = &entry->orom;
+
 	printf("       Platform : Intel(R) ");
+
 	if (orom->capabilities == 0 && orom->driver_features == 0)
 		printf("Matrix Storage Manager\n");
 	else if (imsm_orom_is_enterprise(orom) && orom->major_ver >= 6)
@@ -2673,6 +2676,7 @@ static void print_imsm_capability(const struct imsm_orom *orom)
 	else
 		printf("Rapid Storage Technology%s\n",
 			imsm_orom_is_enterprise(orom) ? " enterprise" : "");
+
 	if (orom->major_ver || orom->minor_ver || orom->hotfix_ver || orom->build) {
 		if (imsm_orom_is_vmd_without_efi(orom))
 			printf("        Version : %d.%d\n", orom->major_ver, orom->minor_ver);
@@ -2690,11 +2694,19 @@ static void print_imsm_capability(const struct imsm_orom *orom)
 	printf("\n");
 
 	printf("    2TB volumes :%s supported\n", (orom->attr & IMSM_OROM_ATTR_2TB) ? "" : " not");
+
 	printf("      2TB disks :%s supported\n",
 	       (orom->attr & IMSM_OROM_ATTR_2TB_DISK) ? "" : " not");
+
 	printf("      Max Disks : %d\n", orom->tds);
+
 	printf("    Max Volumes : %d per array, %d per %s\n", orom->vpa, orom->vphba,
 	       imsm_orom_is_nvme(orom) ? "platform" : "controller");
+
+	if (entry->type == SYS_DEV_VMD || entry->type == SYS_DEV_NVME)
+		/* This is only meaningful for controllers with nvme support */
+		printf(" 3rd party NVMe :%s supported\n",
+		       imsm_orom_has_tpv_support(&entry->orom) ? "" : " not");
 	return;
 }
 
@@ -2733,26 +2745,25 @@ static int detail_platform_imsm(int verbose, int enumerate_only, char *controlle
 	 * platform capabilities.  If raid support is disabled in the BIOS the
 	 * option-rom capability structure will not be available.
 	 */
+	const struct orom_entry *entry;
 	struct sys_dev *list, *hba;
-	int host_base = 0;
+	struct devid_list *devid;
 	int port_count = 0;
-	int result=1;
+	int host_base = 0;
+	int result = 1;
 
 	if (enumerate_only) {
 		if (check_no_platform())
 			return 0;
+
 		list = find_intel_devices();
 		if (!list)
 			return 2;
-		for (hba = list; hba; hba = hba->next) {
-			if (find_imsm_capability(hba)) {
-				result = 0;
-				break;
-			}
-			else
-				result = 2;
-		}
-		return result;
+
+		for (hba = list; hba; hba = hba->next)
+			if (find_imsm_capability(hba))
+				return 0;
+		return 2;
 	}
 
 	list = find_intel_devices();
@@ -2768,6 +2779,7 @@ static int detail_platform_imsm(int verbose, int enumerate_only, char *controlle
 			continue;
 		if (!find_imsm_capability(hba)) {
 			char buf[PATH_MAX];
+
 			pr_err("imsm capabilities not found for controller: %s (type %s)\n",
 				  hba->type == SYS_DEV_VMD || hba->type == SYS_DEV_SATA_VMD ?
 				  vmd_domain_to_controller(hba, buf) :
@@ -2783,40 +2795,27 @@ static int detail_platform_imsm(int verbose, int enumerate_only, char *controlle
 		return result;
 	}
 
-	const struct orom_entry *entry;
-
 	for (entry = orom_entries; entry; entry = entry->next) {
-		if (entry->type == SYS_DEV_VMD) {
-			print_imsm_capability(&entry->orom);
-			printf(" 3rd party NVMe :%s supported\n",
-			    imsm_orom_has_tpv_support(&entry->orom)?"":" not");
+		print_imsm_capability(entry);
+
+		if (entry->type == SYS_DEV_VMD || entry->type == SYS_DEV_NVME) {
 			for (hba = list; hba; hba = hba->next) {
-				if (hba->type == SYS_DEV_VMD) {
-					char buf[PATH_MAX];
+				char buf[PATH_MAX];
+
+				if (hba->type != entry->type)
+					continue;
+
+				if (hba->type == SYS_DEV_VMD)
 					printf(" I/O Controller : %s (%s)\n",
-						vmd_domain_to_controller(hba, buf), get_sys_dev_type(hba->type));
-					if (print_nvme_info(hba)) {
-						if (verbose > 0)
-							pr_err("failed to get devices attached to VMD domain.\n");
-						result |= 2;
-					}
-				}
+					       vmd_domain_to_controller(hba, buf),
+					       get_sys_dev_type(hba->type));
+
+				print_nvme_info(hba);
 			}
 			printf("\n");
 			continue;
 		}
 
-		print_imsm_capability(&entry->orom);
-		if (entry->type == SYS_DEV_NVME) {
-			for (hba = list; hba; hba = hba->next) {
-				if (hba->type == SYS_DEV_NVME)
-					print_nvme_info(hba);
-			}
-			printf("\n");
-			continue;
-		}
-
-		struct devid_list *devid;
 		for (devid = entry->devid_list; devid; devid = devid->next) {
 			hba = device_by_id(devid->devid);
 			if (!hba)
@@ -5976,12 +5975,12 @@ static int add_to_super_imsm(struct supertype *st, mdu_disk_info_t *dk,
 			     unsigned long long data_offset)
 {
 	struct intel_super *super = st->sb;
-	struct dl *dd;
-	unsigned long long size;
 	unsigned int member_sector_size;
+	unsigned long long size;
+	struct stat stb;
+	struct dl *dd;
 	__u32 id;
 	int rv;
-	struct stat stb;
 
 	/* If we are on an RAID enabled platform check that the disk is
 	 * attached to the raid controller.
@@ -5991,114 +5990,85 @@ static int add_to_super_imsm(struct supertype *st, mdu_disk_info_t *dk,
 	rv = find_intel_hba_capability(fd, super, devname);
 	/* no orom/efi or non-intel hba of the disk */
 	if (rv != 0) {
-		dprintf("capability: %p fd: %d ret: %d\n",
-			super->orom, fd, rv);
-		return 1;
+		dprintf("capability: %p fd: %d ret: %d\n", super->orom, fd, rv);
+		return MDADM_STATUS_ERROR;
 	}
 
 	if (super->current_vol >= 0)
 		return add_to_super_imsm_volume(st, dk, fd, devname);
 
 	if (fstat(fd, &stb) != 0)
-		return 1;
+		return MDADM_STATUS_ERROR;
+
 	dd = xcalloc(sizeof(*dd), 1);
+
+	if (devname)
+		dd->devname = xstrdup(devname);
+
+	if (sysfs_disk_to_scsi_id(fd, &id) == 0)
+		dd->disk.scsi_id = __cpu_to_le32(id);
+
 	dd->major = major(stb.st_rdev);
 	dd->minor = minor(stb.st_rdev);
-	dd->devname = devname ? xstrdup(devname) : NULL;
-	dd->fd = fd;
-	dd->e = NULL;
 	dd->action = DISK_ADD;
+	dd->fd = fd;
+
 	rv = imsm_read_serial(fd, devname, dd->serial, MAX_RAID_SERIAL_LEN);
 	if (rv) {
 		pr_err("failed to retrieve scsi serial, aborting\n");
-		__free_imsm_disk(dd, 0);
-		abort();
+		goto error;
 	}
 
 	if (super->hba && ((super->hba->type == SYS_DEV_NVME) ||
 	   (super->hba->type == SYS_DEV_VMD))) {
-		int i;
-		char cntrl_path[PATH_MAX];
-		char *cntrl_name;
 		char pci_dev_path[PATH_MAX];
+		char cntrl_path[PATH_MAX];
 
 		if (!diskfd_to_devpath(fd, 2, pci_dev_path) ||
 		    !diskfd_to_devpath(fd, 1, cntrl_path)) {
 			pr_err("failed to get dev paths, aborting\n");
-			__free_imsm_disk(dd, 0);
-			return 1;
+			goto error;
 		}
 
-		cntrl_name = basename(cntrl_path);
 		if (is_multipath_nvme(fd))
 			pr_err("%s controller supports Multi-Path I/O, Intel (R) VROC does not support multipathing\n",
-			       cntrl_name);
+			       basename(cntrl_path));
 
-		if (devpath_to_vendor(pci_dev_path) == 0x8086) {
-			/*
-			 * If Intel's NVMe drive has serial ended with
-			 * "-A","-B","-1" or "-2" it means that this is "x8"
-			 * device (double drive on single PCIe card).
-			 * User should be warned about potential data loss.
-			 */
-			for (i = MAX_RAID_SERIAL_LEN-1; i > 0; i--) {
-				/* Skip empty character at the end */
-				if (dd->serial[i] == 0)
-					continue;
-
-				if (((dd->serial[i] == 'A') ||
-				   (dd->serial[i] == 'B') ||
-				   (dd->serial[i] == '1') ||
-				   (dd->serial[i] == '2')) &&
-				   (dd->serial[i-1] == '-'))
-					pr_err("\tThe action you are about to take may put your data at risk.\n"
-						"\tPlease note that x8 devices may consist of two separate x4 devices "
-						"located on a single PCIe port.\n"
-						"\tRAID 0 is the only supported configuration for this type of x8 device.\n");
-				break;
-			}
-		} else if (super->hba->type == SYS_DEV_VMD && super->orom &&
-		    !imsm_orom_has_tpv_support(super->orom)) {
+		if (super->orom && !imsm_orom_has_tpv_support(super->orom)) {
 			pr_err("\tPlatform configuration does not support non-Intel NVMe drives.\n"
 			       "\tPlease refer to Intel(R) RSTe/VROC user guide.\n");
-			__free_imsm_disk(dd, 0);
-			return 1;
+			goto error;
 		}
 	}
 
-	get_dev_size(fd, NULL, &size);
-	if (!get_dev_sector_size(fd, NULL, &member_sector_size)) {
-		__free_imsm_disk(dd, 0);
-		return 1;
-	}
+	if (!get_dev_size(fd, NULL, &size) || !get_dev_sector_size(fd, NULL, &member_sector_size))
+		goto error;
 
-	if (super->sector_size == 0) {
+	if (super->sector_size == 0)
 		/* this a first device, so sector_size is not set yet */
 		super->sector_size = member_sector_size;
-	}
 
 	/* clear migr_rec when adding disk to container */
-	memset(super->migr_rec_buf, 0, MIGR_REC_BUF_SECTORS*MAX_SECTOR_SIZE);
-	if (lseek64(fd, size - MIGR_REC_SECTOR_POSITION*member_sector_size,
-	    SEEK_SET) >= 0) {
-		if ((unsigned int)write(fd, super->migr_rec_buf,
-		    MIGR_REC_BUF_SECTORS*member_sector_size) !=
-		    MIGR_REC_BUF_SECTORS*member_sector_size)
+	memset(super->migr_rec_buf, 0, MIGR_REC_BUF_SECTORS * MAX_SECTOR_SIZE);
+
+	if (lseek64(fd, (size - MIGR_REC_SECTOR_POSITION * member_sector_size), SEEK_SET) >= 0) {
+		unsigned int nbytes = MIGR_REC_BUF_SECTORS * member_sector_size;
+
+		if ((unsigned int)write(fd, super->migr_rec_buf, nbytes) != nbytes)
 			perror("Write migr_rec failed");
 	}
 
 	size /= 512;
 	serialcpy(dd->disk.serial, dd->serial);
 	set_total_blocks(&dd->disk, size);
+
 	if (__le32_to_cpu(dd->disk.total_blocks_hi) > 0) {
 		struct imsm_super *mpb = super->anchor;
+
 		mpb->attributes |= MPB_ATTRIB_2TB_DISK;
 	}
+
 	mark_spare(dd);
-	if (sysfs_disk_to_scsi_id(fd, &id) == 0)
-		dd->disk.scsi_id = __cpu_to_le32(id);
-	else
-		dd->disk.scsi_id = __cpu_to_le32(0);
 
 	if (st->update_tail) {
 		dd->next = super->disk_mgmt_list;
@@ -6113,7 +6083,11 @@ static int add_to_super_imsm(struct supertype *st, mdu_disk_info_t *dk,
 		write_super_imsm_spare(super, dd);
 	}
 
-	return 0;
+	return MDADM_STATUS_SUCCESS;
+
+error:
+	__free_imsm_disk(dd, 0);
+	return MDADM_STATUS_ERROR;
 }
 
 static int remove_from_super_imsm(struct supertype *st, mdu_disk_info_t *dk)
@@ -7077,7 +7051,7 @@ get_devices(const char *hba_path)
 		path = devt_to_devpath(makedev(major, minor), 1, NULL);
 		if (!path)
 			continue;
-		if (!path_attached_to_hba(path, hba_path)) {
+		if (!is_path_attached_to_hba(path, hba_path)) {
 			free(path);
 			path = NULL;
 			continue;
@@ -12657,8 +12631,6 @@ static int imsm_manage_reshape(
 			dprintf("wait_for_reshape_imsm returned error!\n");
 			goto abort;
 		}
-		if (sigterm)
-			goto abort;
 
 		if (save_checkpoint_imsm(st, sra, UNIT_SRC_NORMAL) == 1) {
 			/* ignore error == 2, this can mean end of reshape here
@@ -12666,6 +12638,9 @@ static int imsm_manage_reshape(
 			dprintf("imsm: Cannot write checkpoint to migration record (UNIT_SRC_NORMAL)\n");
 			goto abort;
 		}
+
+		if (sigterm)
+			goto abort;
 
 	}
 
