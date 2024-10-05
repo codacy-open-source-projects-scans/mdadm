@@ -803,6 +803,9 @@ enum sysfs_read_flags {
 
 #define SYSFS_MAX_BUF_SIZE 64
 
+extern mdadm_status_t sysfs_write_descriptor(const int fd, const char *value,
+					     const ssize_t len, int *errno_p);
+extern mdadm_status_t write_attr(const char *value, const int fd);
 extern void sysfs_get_container_devnm(struct mdinfo *mdi, char *buf);
 
 /* If fd >= 0, get the array it is open on,
@@ -1606,7 +1609,7 @@ extern int Incremental(struct mddev_dev *devlist, struct context *c,
 		       struct supertype *st);
 extern void RebuildMap(void);
 extern int IncrementalScan(struct context *c, char *devnm);
-extern int IncrementalRemove(char *devname, char *path, int verbose);
+extern int Incremental_remove(char *devname, char *path, int verbose);
 extern int CreateBitmap(char *filename, int force, char uuid[16],
 			unsigned long chunksize, unsigned long daemon_sleep,
 			unsigned long write_behind,
@@ -1933,11 +1936,6 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
 #define pr_info(fmt, args...) printf("%s: "fmt, Name, ##args)
 
 #define pr_vrb(fmt, arg...) ((void)(verbose && pr_err(fmt, ##arg)))
-
-void *xmalloc(size_t len);
-void *xrealloc(void *ptr, size_t len);
-void *xcalloc(size_t num, size_t size);
-char *xstrdup(const char *str);
 
 #define	LEVEL_MULTIPATH		(-4)
 #define	LEVEL_LINEAR		(-1)
