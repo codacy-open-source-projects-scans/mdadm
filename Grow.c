@@ -30,12 +30,6 @@
 #include	<stdint.h>
 #include	<sys/wait.h>
 
-#if ! defined(__BIG_ENDIAN) && ! defined(__LITTLE_ENDIAN)
-#error no endian defined
-#endif
-#include	"md_u.h"
-#include	"md_p.h"
-
 int restore_backup(struct supertype *st,
 		   struct mdinfo *content,
 		   int working_disks,
@@ -285,7 +279,6 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 	 * find all the active devices, and write the bitmap block
 	 * to all devices
 	 */
-	mdu_bitmap_file_t bmf;
 	mdu_array_info_t array;
 	struct supertype *st;
 	char *subarray = NULL;
@@ -294,40 +287,21 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 	struct mdinfo *mdi;
 
 	/*
-	 * We only ever get called if s->bitmap_file is != NULL, so this check
+	 * We only ever get called if bitmap is not none, so this check
 	 * is just here to quiet down static code checkers.
 	 */
-	if (!s->bitmap_file)
+	if (s->btype == BitmapUnknown)
 		return 1;
 
-	if (strcmp(s->bitmap_file, "clustered") == 0)
+	if (s->btype == BitmapCluster)
 		major = BITMAP_MAJOR_CLUSTERED;
 
-	if (ioctl(fd, GET_BITMAP_FILE, &bmf) != 0) {
-		if (errno == ENOMEM)
-			pr_err("Memory allocation failure.\n");
-		else
-			pr_err("bitmaps not supported by this kernel.\n");
-		return 1;
-	}
-	if (bmf.pathname[0]) {
-		if (str_is_none(s->bitmap_file) == true) {
-			if (ioctl(fd, SET_BITMAP_FILE, -1) != 0) {
-				pr_err("failed to remove bitmap %s\n",
-					bmf.pathname);
-				return 1;
-			}
-			return 0;
-		}
-		pr_err("%s already has a bitmap (%s)\n", devname, bmf.pathname);
-		return 1;
-	}
 	if (md_get_array_info(fd, &array) != 0) {
 		pr_err("cannot get array status for %s\n", devname);
 		return 1;
 	}
 	if (array.state & (1 << MD_SB_BITMAP_PRESENT)) {
-		if (str_is_none(s->bitmap_file) == true) {
+		if (s->btype == BitmapNone) {
 			array.state &= ~(1 << MD_SB_BITMAP_PRESENT);
 			if (md_set_array_info(fd, &array) != 0) {
 				if (array.state & (1 << MD_SB_CLUSTERED))
@@ -342,10 +316,11 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 		return 1;
 	}
 
-	if (str_is_none(s->bitmap_file) == true) {
+	if (s->btype == BitmapNone) {
 		pr_err("no bitmap found on %s\n", devname);
 		return 1;
 	}
+
 	if (array.level <= 0) {
 		pr_err("Bitmaps not meaningful with level %s\n",
 			map_num(pers, array.level)?:"of this array");
@@ -371,7 +346,7 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 		ncopies = (array.layout & 255) * ((array.layout >> 8) & 255);
 		bitmapsize = bitmapsize * array.raid_disks / ncopies;
 
-		if (strcmp(s->bitmap_file, "clustered") == 0 &&
+		if (s->btype == BitmapCluster &&
 		    !is_near_layout_10(array.layout)) {
 			pr_err("only near layout is supported with clustered raid10\n");
 			return 1;
@@ -402,8 +377,7 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 		free(mdi);
 	}
 
-	if (strcmp(s->bitmap_file, "internal") == 0 ||
-	    strcmp(s->bitmap_file, "clustered") == 0) {
+	if (s->btype == BitmapInternal || s->btype == BitmapCluster) {
 		int rv;
 		int d;
 		int offset_setable = 0;
@@ -432,7 +406,7 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 			if (!dv)
 				continue;
 			if ((disk.state & (1 << MD_DISK_WRITEMOSTLY)) &&
-			   (strcmp(s->bitmap_file, "clustered") == 0)) {
+			    s->btype == BitmapCluster) {
 				pr_err("%s disks marked write-mostly are not supported with clustered bitmap\n",devname);
 				free(mdi);
 				return 1;
@@ -471,7 +445,7 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 						  mdi->bitmap_offset);
 			free(mdi);
 		} else {
-			if (strcmp(s->bitmap_file, "clustered") == 0)
+			if (s->btype == BitmapCluster)
 				array.state |= (1 << MD_SB_CLUSTERED);
 			array.state |= (1 << MD_SB_BITMAP_PRESENT);
 			rv = md_set_array_info(fd, &array);
@@ -482,60 +456,6 @@ int Grow_addbitmap(char *devname, int fd, struct context *c, struct shape *s)
 			pr_err("failed to set internal bitmap.\n");
 			return 1;
 		}
-	} else {
-		int uuid[4];
-		int bitmap_fd;
-		int d;
-		int max_devs = st->max_devs;
-
-		/* try to load a superblock */
-		for (d = 0; d < max_devs; d++) {
-			mdu_disk_info_t disk;
-			char *dv;
-			int fd2;
-			disk.number = d;
-			if (md_get_disk_info(fd, &disk) < 0)
-				continue;
-			if ((disk.major==0 && disk.minor == 0) ||
-			    (disk.state & (1 << MD_DISK_REMOVED)))
-				continue;
-			dv = map_dev(disk.major, disk.minor, 1);
-			if (!dv)
-				continue;
-			fd2 = dev_open(dv, O_RDONLY);
-			if (fd2 >= 0) {
-				if (st->ss->load_super(st, fd2, NULL) == 0) {
-					close(fd2);
-					st->ss->uuid_from_super(st, uuid);
-					break;
-				}
-				close(fd2);
-			}
-		}
-		if (d == max_devs) {
-			pr_err("cannot find UUID for array!\n");
-			return 1;
-		}
-		if (CreateBitmap(s->bitmap_file, c->force, (char*)uuid,
-				 s->bitmap_chunk, c->delay, s->write_behind,
-				 bitmapsize, major)) {
-			return 1;
-		}
-		bitmap_fd = open(s->bitmap_file, O_RDWR);
-		if (bitmap_fd < 0) {
-			pr_err("weird: %s cannot be opened\n", s->bitmap_file);
-			return 1;
-		}
-		if (ioctl(fd, SET_BITMAP_FILE, bitmap_fd) < 0) {
-			int err = errno;
-			if (errno == EBUSY)
-				pr_err("Cannot add bitmap while array is resyncing or reshaping etc.\n");
-			pr_err("Cannot set bitmap file for %s: %s\n",
-				devname, strerror(err));
-			close_fd(&bitmap_fd);
-			return 1;
-		}
-		close_fd(&bitmap_fd);
 	}
 
 	return 0;
@@ -1820,7 +1740,7 @@ static int reshape_array(char *container, int fd, char *devname,
 			 int force, struct mddev_dev *devlist,
 			 unsigned long long data_offset,
 			 char *backup_file, int verbose, int forked,
-			 int restart, int freeze_reshape);
+			 int restart);
 static int reshape_container(char *container, char *devname,
 			     int mdfd,
 			     struct supertype *st,
@@ -2036,7 +1956,8 @@ int Grow_reshape(char *devname, int fd,
 		sysfs_free(sra);
 		return 1;
 	} else if (frozen < 0) {
-		pr_err("%s is performing resync/recovery and cannot be reshaped\n", devname);
+		pr_err("%s is performing resync/recovery and cannot be %s\n", devname,
+		       (s->level != UnSet && s->level != array.level) ? "taken over" : "reshaped");
 		sysfs_free(sra);
 		return 1;
 	}
@@ -2414,7 +2335,7 @@ size_change_error:
 		sync_metadata(st);
 		rv = reshape_array(container, fd, devname, st, &info, c->force,
 				   devlist, s->data_offset, c->backup_file,
-				   c->verbose, 0, 0, 0);
+				   c->verbose, 0, 0);
 		frozen = 0;
 	}
 release:
@@ -2460,6 +2381,7 @@ static int verify_reshape_position(struct mdinfo *info, int level)
 			} else if (info->reshape_progress > position) {
 				pr_err("Fatal error: array reshape was not properly frozen (expected reshape position is %llu, but reshape progress is %llu.\n",
 				       position, info->reshape_progress);
+				pr_err("Reassemble array to try to restore critical sector.\n");
 				ret_val = -1;
 			} else {
 				dprintf("Reshape position in md and metadata are the same;");
@@ -3068,12 +2990,40 @@ static void catch_term(int sig)
 	sigterm = 1;
 }
 
+
+/**
+ * handle_forking() - Handle reshape forking.
+ *
+ * @forked: if already forked.
+ * @devname: device name.
+ * Returns: -1 if fork() failed,
+ *           0 if child process,
+ *           1 if job delegated to forked process or systemd.
+ *
+ * This function is a helper function for reshapes for fork handling.
+ */
+static mdadm_status_t handle_forking(bool forked, char *devname)
+{
+	if (forked)
+		return MDADM_STATUS_FORKED;
+
+	if (devname && continue_via_systemd(devname, GROW_SERVICE, NULL) == MDADM_STATUS_SUCCESS)
+		return MDADM_STATUS_SUCCESS;
+
+	switch (fork()) {
+	case -1: return MDADM_STATUS_ERROR; /* error */
+	case 0: return MDADM_STATUS_FORKED; /* child */
+	default: return MDADM_STATUS_SUCCESS; /* parent */
+	}
+
+}
+
 static int reshape_array(char *container, int fd, char *devname,
 			 struct supertype *st, struct mdinfo *info,
 			 int force, struct mddev_dev *devlist,
 			 unsigned long long data_offset,
 			 char *backup_file, int verbose, int forked,
-			 int restart, int freeze_reshape)
+			 int restart)
 {
 	struct reshape reshape;
 	int spares_needed;
@@ -3557,42 +3507,36 @@ started:
 	}
 	if (restart)
 		sysfs_set_str(sra, NULL, "array_state", "active");
-	if (freeze_reshape) {
+
+	/* Do not run in initrd */
+	if (in_initrd()) {
 		free(fdlist);
 		free(offsets);
 		sysfs_free(sra);
-		pr_err("Reshape has to be continued from location %llu when root filesystem has been mounted.\n",
+		pr_info("Reshape has to be continued from location %llu when root filesystem has been mounted.\n",
 			sra->reshape_progress);
 		return 1;
 	}
-
-	if (!forked)
-		if (continue_via_systemd(container ?: sra->sys_name,
-					 GROW_SERVICE, NULL)) {
-			free(fdlist);
-			free(offsets);
-			sysfs_free(sra);
-			return 0;
-		}
 
 	/* Now we just need to kick off the reshape and watch, while
 	 * handling backups of the data...
 	 * This is all done by a forked background process.
 	 */
-	switch(forked ? 0 : fork()) {
-	case -1:
+	switch (handle_forking(forked, container ? container : sra->sys_name)) {
+	default: /* Unused, only to satisfy compiler. */
+	case MDADM_STATUS_ERROR: /* error */
 		pr_err("Cannot run child to monitor reshape: %s\n",
 			strerror(errno));
 		abort_reshape(sra);
 		goto release;
-	default:
+	case MDADM_STATUS_FORKED: /* child */
+		map_fork();
+		break;
+	case MDADM_STATUS_SUCCESS: /* parent */
 		free(fdlist);
 		free(offsets);
 		sysfs_free(sra);
 		return 0;
-	case 0:
-		map_fork();
-		break;
 	}
 
 	/* Close unused file descriptor in the forked process */
@@ -3761,23 +3705,19 @@ int reshape_container(char *container, char *devname,
 	 */
 	ping_monitor(container);
 
-	if (!forked && !c->freeze_reshape)
-		if (continue_via_systemd(container, GROW_SERVICE, NULL))
-			return 0;
-
-	switch (forked ? 0 : fork()) {
-	case -1: /* error */
+	switch (handle_forking(forked, container)) {
+	default: /* Unused, only to satisfy compiler. */
+	case MDADM_STATUS_ERROR: /* error */
 		perror("Cannot fork to complete reshape\n");
 		unfreeze(st);
 		return 1;
-	default: /* parent */
-		if (!c->freeze_reshape)
-			printf("%s: multi-array reshape continues in background\n", Name);
-		return 0;
-	case 0: /* child */
+	case MDADM_STATUS_FORKED: /* child */
 		manage_fork_fds(0);
 		map_fork();
 		break;
+	case MDADM_STATUS_SUCCESS: /* parent */
+		printf("%s: multi-array reshape continues in background\n", Name);
+		return 0;
 	}
 
 	/* close unused handle in child process
@@ -3870,11 +3810,11 @@ int reshape_container(char *container, char *devname,
 
 		rv = reshape_array(container, fd, adev, st,
 				   content, c->force, NULL, INVALID_SECTORS,
-				   c->backup_file, c->verbose, 1, restart,
-				   c->freeze_reshape);
+				   c->backup_file, c->verbose, 1, restart);
 		close(fd);
 
-		if (c->freeze_reshape) {
+		/* Do not run reshape in initrd but let it initialize.*/
+		if (in_initrd()) {
 			sysfs_free(cc);
 			exit(0);
 		}
@@ -4340,10 +4280,10 @@ static int grow_backup(struct mdinfo *sra,
 		bsb.magic[15] = '2';
 	for (i = 0; i < dests; i++)
 		if (part)
-			lseek64(destfd[i], destoffsets[i] +
-				__le64_to_cpu(bsb.devstart2)*512, 0);
+			lseek(destfd[i], destoffsets[i] +
+			      __le64_to_cpu(bsb.devstart2) * 512, 0);
 		else
-			lseek64(destfd[i], destoffsets[i], 0);
+			lseek(destfd[i], destoffsets[i], 0);
 
 	rv = save_stripes(sources, offsets, disks, chunk, level, layout,
 			  dests, destfd, offset * 512 * odata,
@@ -4353,24 +4293,24 @@ static int grow_backup(struct mdinfo *sra,
 		return rv;
 	bsb.mtime = __cpu_to_le64(time(0));
 	for (i = 0; i < dests; i++) {
-		bsb.devstart = __cpu_to_le64(destoffsets[i]/512);
+		unsigned long long seek = destoffsets[i] + stripes * chunk * odata;
 
-		bsb.sb_csum = bsb_csum((char*)&bsb,
-				       ((char*)&bsb.sb_csum)-((char*)&bsb));
+		bsb.devstart = __cpu_to_le64(destoffsets[i] / 512);
+
+		bsb.sb_csum = bsb_csum((char *)&bsb, ((char *)&bsb.sb_csum) - ((char *)&bsb));
 		if (memcmp(bsb.magic, "md_backup_data-2", 16) == 0)
-			bsb.sb_csum2 = bsb_csum((char*)&bsb,
-						((char*)&bsb.sb_csum2)-((char*)&bsb));
+			bsb.sb_csum2 = bsb_csum((char *)&bsb,
+						((char *)&bsb.sb_csum2) - ((char *)&bsb));
 
 		rv = -1;
-		if ((unsigned long long)lseek64(destfd[i],
-						destoffsets[i] - 4096, 0) !=
+
+		if ((unsigned long long)lseek(destfd[i], destoffsets[i] - 4096, 0) !=
 		    destoffsets[i] - 4096)
 			break;
 		if (write(destfd[i], &bsb, 512) != 512)
 			break;
 		if (destoffsets[i] > 4096) {
-			if ((unsigned long long)lseek64(destfd[i], destoffsets[i]+stripes*chunk*odata, 0) !=
-			    destoffsets[i]+stripes*chunk*odata)
+			if ((unsigned long long)lseek(destfd[i], seek, 0) != seek)
 				break;
 			if (write(destfd[i], &bsb, 512) != 512)
 				break;
@@ -4419,7 +4359,7 @@ static int forget_backup(int dests, int *destfd,
 		if (memcmp(bsb.magic, "md_backup_data-2", 16) == 0)
 			bsb.sb_csum2 = bsb_csum((char*)&bsb,
 						((char*)&bsb.sb_csum2)-((char*)&bsb));
-		if ((unsigned long long)lseek64(destfd[i], destoffsets[i]-4096, 0) !=
+		if ((unsigned long long)lseek(destfd[i], destoffsets[i]-4096, 0) !=
 		    destoffsets[i]-4096)
 			rv = -1;
 		if (rv == 0 && write(destfd[i], &bsb, 512) != 512)
@@ -4447,8 +4387,8 @@ static void validate(int afd, int bfd, unsigned long long offset)
 	 */
 	if (afd < 0)
 		return;
-	if (lseek64(bfd, offset - 4096, 0) < 0) {
-		pr_err("lseek64 fails %d:%s\n", errno, strerror(errno));
+	if (lseek(bfd, offset - 4096, 0) < 0) {
+		pr_err("lseek fails %d:%s\n", errno, strerror(errno));
 		return;
 	}
 	if (read(bfd, &bsb2, 512) != 512)
@@ -4481,8 +4421,8 @@ static void validate(int afd, int bfd, unsigned long long offset)
 			}
 		}
 
-		if (lseek64(bfd, offset, 0) < 0) {
-			pr_err("lseek64 fails %d:%s\n", errno, strerror(errno));
+		if (lseek(bfd, offset, 0) < 0) {
+			pr_err("lseek fails %d:%s\n", errno, strerror(errno));
 			goto out;
 		}
 		if ((unsigned long long)read(bfd, bbuf, len) != len) {
@@ -4490,8 +4430,8 @@ static void validate(int afd, int bfd, unsigned long long offset)
 			fail("read first backup failed");
 		}
 
-		if (lseek64(afd, __le64_to_cpu(bsb2.arraystart)*512, 0) < 0) {
-			pr_err("lseek64 fails %d:%s\n", errno, strerror(errno));
+		if (lseek(afd, __le64_to_cpu(bsb2.arraystart)*512, 0) < 0) {
+			pr_err("lseek fails %d:%s\n", errno, strerror(errno));
 			goto out;
 		}
 		if ((unsigned long long)read(afd, abuf, len) != len)
@@ -4510,14 +4450,14 @@ static void validate(int afd, int bfd, unsigned long long offset)
 			bbuf = xmalloc(abuflen);
 		}
 
-		if (lseek64(bfd, offset+__le64_to_cpu(bsb2.devstart2)*512, 0) < 0) {
-			pr_err("lseek64 fails %d:%s\n", errno, strerror(errno));
+		if (lseek(bfd, offset+__le64_to_cpu(bsb2.devstart2)*512, 0) < 0) {
+			pr_err("lseek fails %d:%s\n", errno, strerror(errno));
 			goto out;
 		}
 		if ((unsigned long long)read(bfd, bbuf, len) != len)
 			fail("read second backup failed");
-		if (lseek64(afd, __le64_to_cpu(bsb2.arraystart2)*512, 0) < 0) {
-			pr_err("lseek64 fails %d:%s\n", errno, strerror(errno));
+		if (lseek(afd, __le64_to_cpu(bsb2.arraystart2)*512, 0) < 0) {
+			pr_err("lseek fails %d:%s\n", errno, strerror(errno));
 			goto out;
 		}
 		if ((unsigned long long)read(afd, abuf, len) != len)
@@ -4800,7 +4740,7 @@ int Grow_restart(struct supertype *st, struct mdinfo *info, int *fdlist,
 			st->ss->getinfo_super(st, &dinfo, NULL);
 			st->ss->free_super(st);
 
-			if (lseek64(fd,
+			if (lseek(fd,
 				    (dinfo.data_offset + dinfo.component_size - 8) <<9,
 				    0) < 0) {
 				pr_err("Cannot seek on device %d\n", i);
@@ -4900,7 +4840,7 @@ int Grow_restart(struct supertype *st, struct mdinfo *info, int *fdlist,
 					goto nonew; /* No new data here */
 			}
 		}
-		if (lseek64(fd, __le64_to_cpu(bsb.devstart)*512, 0)< 0) {
+		if (lseek(fd, __le64_to_cpu(bsb.devstart) * 512, 0) < 0) {
 		second_fail:
 			if (verbose)
 				pr_err("Failed to verify secondary backup-metadata block on %s\n",
@@ -4908,7 +4848,7 @@ int Grow_restart(struct supertype *st, struct mdinfo *info, int *fdlist,
 			continue; /* Cannot seek */
 		}
 		/* There should be a duplicate backup superblock 4k before here */
-		if (lseek64(fd, -4096, 1) < 0 ||
+		if (lseek(fd, -4096, 1) < 0 ||
 		    read(fd, &bsb2, sizeof(bsb2)) != sizeof(bsb2))
 			goto second_fail; /* Cannot find leading superblock */
 		if (bsb.magic[15] == '1')
@@ -5293,8 +5233,7 @@ int Grow_continue(int mdfd, struct supertype *st, struct mdinfo *info,
 	} else
 		ret_val = reshape_array(NULL, mdfd, "array", st, info, 1,
 					NULL, INVALID_SECTORS, c->backup_file,
-					0, forked, 1 | info->reshape_active,
-					c->freeze_reshape);
+					0, forked, 1 | info->reshape_active);
 
 	return ret_val;
 }
