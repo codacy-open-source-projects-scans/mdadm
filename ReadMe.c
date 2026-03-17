@@ -28,10 +28,10 @@
 #include "mdadm.h"
 
 #ifndef VERSION
-#define VERSION "4.5"
+#define VERSION "4.6"
 #endif
 #ifndef VERS_DATE
-#define VERS_DATE "2025-12-16"
+#define VERS_DATE "2026-03-16"
 #endif
 #ifndef EXTRAVERSION
 #define EXTRAVERSION ""
@@ -227,6 +227,8 @@ char Help[] =
 "            Create a new array from unused devices.\n"
 "       mdadm --assemble device options...\n"
 "            Assemble a previously created array.\n"
+"       mdadm --detail device options...\n"
+"            Show detailed status of an array..\n"
 "       mdadm --build device options...\n"
 "            Create or assemble an array without metadata.\n"
 "       mdadm --manage device options...\n"

@@ -561,6 +561,7 @@ enum bitmap_type {
 	BitmapNone,
 	BitmapInternal,
 	BitmapCluster,
+	BitmapLockless,
 	BitmapUnknown,
 };
 
@@ -860,7 +861,7 @@ extern int restore_stripes(int *dest, unsigned long long *offsets,
 			   unsigned long long start, unsigned long long length,
 			   char *src_buf);
 extern bool sysfs_is_libata_allow_tpm_enabled(const int verbose);
-extern bool init_md_mod_param(void);
+extern bool init_md_mod(void);
 
 #ifndef Sendmail
 #define Sendmail "/usr/lib/sendmail -t"
@@ -1157,7 +1158,9 @@ extern struct superswitch {
 	 */
 	int (*add_internal_bitmap)(struct supertype *st, int *chunkp,
 				   int delay, int write_behind,
-				   unsigned long long size, int may_change, int major);
+				   unsigned long long size, int may_change,
+				   int major, bool assume_clean);
+	int (*get_bitmap_type)(struct supertype *st);
 	/* Perform additional setup required to activate a bitmap.
 	 */
 	int (*set_bitmap)(struct supertype *st, struct mdinfo *info);
@@ -1481,7 +1484,7 @@ void domain_add(struct domainlist **domp, char *domain);
 extern void policy_save_path(char *id_path, struct map_ent *array);
 extern int policy_check_path(struct mdinfo *disk, struct map_ent *array);
 
-extern void sysfs_rules_apply(char *devnm, struct mdinfo *dev);
+extern void sysfs_rules_apply(char *devnm, struct mdinfo *dev, const struct supertype *st);
 extern void sysfsline(char *line);
 
 #if __GNUC__ < 3
@@ -1636,6 +1639,7 @@ extern char *conf_get_homehost(int *require_homehostp);
 extern char *conf_get_homecluster(void);
 extern int conf_get_monitor_delay(void);
 extern bool conf_get_sata_opal_encryption_no_verify(void);
+extern bool conf_get_probing_ddf_extended(void);
 extern char *conf_line(FILE *file);
 extern char *conf_word(FILE *file, int allow_key);
 extern void print_quoted(char *str);

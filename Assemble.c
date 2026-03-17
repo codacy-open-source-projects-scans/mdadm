@@ -1104,7 +1104,7 @@ static int start_array(int mdfd,
 	}
 
 	if (is_container(content->array.level)) {
-		sysfs_rules_apply(mddev, content);
+		sysfs_rules_apply(mddev, content, st);
 		if (c->verbose >= 0) {
 			pr_err("Container %s has been assembled with %d drive%s",
 			       mddev, okcnt + sparecnt + journalcnt,
@@ -1184,7 +1184,7 @@ static int start_array(int mdfd,
 			rv = ioctl(mdfd, RUN_ARRAY, NULL);
 		reopen_mddev(mdfd); /* drop O_EXCL */
 		if (rv == 0) {
-			sysfs_rules_apply(mddev, content);
+			sysfs_rules_apply(mddev, content, st);
 			if (c->verbose >= 0) {
 				pr_info("%s has been started with %d drive%s",
 				       mddev, okcnt, okcnt==1?"":"s");
@@ -1376,7 +1376,7 @@ int Assemble(char *mddev, struct mddev_ident *ident,
 	int *best = NULL; /* indexed by raid_disk */
 	int bestcnt = 0;
 	int devcnt;
-	unsigned int okcnt, sparecnt, rebuilding_cnt, replcnt, journalcnt;
+	unsigned int okcnt, sparecnt, rebuilding_cnt, journalcnt;
 	int journal_clean = 0;
 	int i;
 	int was_forced = 0;
@@ -1629,7 +1629,6 @@ try_again:
 	 */
 	avail = xcalloc(content->array.raid_disks, 1);
 	okcnt = 0;
-	replcnt = 0;
 	sparecnt=0;
 	journalcnt=0;
 	rebuilding_cnt=0;
@@ -1689,8 +1688,7 @@ try_again:
 					if (!avail[i/2]) {
 						okcnt++;
 						avail[i/2]=1;
-					} else
-						replcnt++;
+					}
 				} else
 					rebuilding_cnt++;
 			} else if (devices[j].i.disk.raid_disk != MD_DISK_ROLE_JOURNAL)
@@ -1827,6 +1825,11 @@ try_again:
 			       mddev);
 		close(fd);
 	}
+
+	if (st->ss->get_bitmap_type &&
+	    st->ss->get_bitmap_type(st) == BITMAP_MAJOR_LOCKLESS &&
+	    sysfs_set_str(content, NULL, "bitmap_type", "llbitmap"))
+		goto out;
 
 	/* If we are in the middle of a reshape we may need to restore saved data
 	 * that was moved aside due to the reshape overwriting live data
@@ -2219,7 +2222,7 @@ int assemble_container_content(struct supertype *st, int mdfd,
 	else {
 		set_array_assembly_status(c, result, INCR_YES, &array);
 		wait_for(chosen_name, mdfd);
-		sysfs_rules_apply(chosen_name, content);
+		sysfs_rules_apply(chosen_name, content, st);
 	}
 
 	return err;

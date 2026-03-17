@@ -181,6 +181,7 @@ struct imsm_map {
 #define IMSM_T_RAID1 1
 #define IMSM_T_RAID5 5
 #define IMSM_T_RAID10 10
+#define IMSM_T_LEVEL_UNKNOWN 255
 	__u8  num_members;	/* number of member disks */
 	__u8  num_domains;	/* number of parity domains */
 	__u8  failed_disk_num;  /* valid only when state is degraded */
@@ -3826,11 +3827,13 @@ static void getinfo_super_imsm(struct supertype *st, struct mdinfo *info, char *
 	/* Set raid_disks to zero so that Assemble will always pull in valid
 	 * spares
 	 */
+	mpb = super->anchor;
+
 	info->array.raid_disks    = 0;
 	info->array.level         = LEVEL_CONTAINER;
 	info->array.layout        = 0;
 	info->array.md_minor      = -1;
-	info->array.ctime         = 0; /* N/A for imsm */
+	info->array.ctime         = __le64_to_cpu(mpb->creation_time);
 	info->array.utime         = 0;
 	info->array.chunk_size    = 0;
 
@@ -3850,7 +3853,6 @@ static void getinfo_super_imsm(struct supertype *st, struct mdinfo *info, char *
 	info->bb.supported = 1;
 
 	/* do we have the all the insync disks that we expect? */
-	mpb = super->anchor;
 	info->events = __le32_to_cpu(mpb->generation_num);
 
 	for (i = 0; i < mpb->num_raid_devs; i++) {
@@ -5791,6 +5793,7 @@ static int init_super_imsm_volume(struct supertype *st, mdu_array_info_t *info,
 	}
 	map->num_members = info->raid_disks;
 
+	map->raid_level = IMSM_T_LEVEL_UNKNOWN;
 	update_imsm_raid_level(map, info->level);
 	set_num_domains(map);
 
@@ -10003,7 +10006,7 @@ static int apply_takeover_update(struct imsm_update_takeover *u,
 	struct imsm_dev *dev_new;
 	struct imsm_map *map;
 	struct dl *dm, *du;
-	int i;
+	unsigned int i;
 
 	for (dv = super->devlist; dv; dv = dv->next)
 		if (dv->index == (unsigned int)u->subarray) {
@@ -13011,7 +13014,7 @@ static int validate_internal_bitmap_imsm(struct supertype *st)
 static int add_internal_bitmap_imsm(struct supertype *st, int *chunkp,
 				    int delay, int write_behind,
 				    unsigned long long size, int may_change,
-				    int amajor)
+				    int amajor, bool assume_clean)
 {
 	struct intel_super *super = st->sb;
 	int vol_idx = super->current_vol;
